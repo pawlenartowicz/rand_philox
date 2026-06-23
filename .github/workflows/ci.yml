@@ -1,0 +1,56 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # beta is informational — upstream rustc regressions shouldn't gate merges.
+    continue-on-error: ${{ matrix.rust == 'beta' }}
+    strategy:
+      matrix:
+        rust: [stable, beta, "1.85"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+      - run: cargo test --doc --locked
+      # The no-feature core must compile and pass on its own (no_std, zero-dep).
+      - run: cargo test --no-default-features --locked
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+      - uses: taiki-e/install-action@wasmtime
+      # WASM-clean claim: the zero-dep core builds with no features, and the full
+      # default surface builds too.
+      - run: cargo build --target wasm32-unknown-unknown --no-default-features --locked
+      - run: cargo build --target wasm32-unknown-unknown --locked
+      # Run the suite on wasm to pin the no-float / no_std claim at runtime.
+      - run: cargo test --target wasm32-wasip1 --lib --tests --locked
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked
+  deny:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # promote to required once the policy settles
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check

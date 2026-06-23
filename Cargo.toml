@@ -1,0 +1,30 @@
+[package]
+name = "rand_philox"
+version = "0.1.0"
+authors = ["Paweł Lenartowicz"]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Counter-based Philox4x32-10 RNG with a reproducibility contract: bit-identical, KAT-pinned, no_std, no float in core, RngCore drop-in"
+keywords = ["rng", "philox", "random", "no_std", "reproducible"]
+categories = ["algorithms", "no-std", "science"]
+readme = "README.md"
+repository = "https://github.com/pawlenartowicz/rand_philox"
+
+[features]
+default = ["rand_core"]
+# The rand-ecosystem drop-in: TryRng/SeedableRng (hence Rng/RngCore) over Philox.
+rand_core = ["dep:rand_core"]
+
+[dependencies]
+rand_core = { version = "0.10", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+# `all` only (not `pedantic`): CI runs clippy with `-D warnings`, which would
+# promote pedantic warnings to errors — and an RNG is intrinsically cast-heavy
+# (checked word/byte truncations), where the pedantic cast lints are pure noise.
+all = "deny"

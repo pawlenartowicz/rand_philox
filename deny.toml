@@ -1,0 +1,20 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Only the licenses present in the dep graph. The sole dependency is the optional
+# `rand_core` (MIT OR Apache-2.0); the core has none. Verify with `cargo deny
+# list` and add entries only when a crate actually introduces a new license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
