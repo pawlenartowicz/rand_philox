@@ -10,11 +10,13 @@
 //! # Layers
 //!
 //! - [`philox4x32_10`] — the block function, the KAT-frozen primitive.
-//! - [`splitmix64`] / [`u32_to_unit_f32`] — generic leaf helpers (seed avalanche;
-//!   word → open-interval `f32`). The single float touch in the crate.
+//! - [`splitmix64`] / [`u32_to_unit_f32`] / [`u32_to_unit_f64`] — generic leaf
+//!   helpers (seed avalanche; word → open-interval `f32` / `f64`). The only float
+//!   touches in the crate.
 //! - [`Philox`] — counter-addressable RNG: `(key, 128-bit counter)` → reproducible
 //!   words at any counter position, with buffered [`Philox::next_u32`] /
-//!   [`Philox::next_u64`], [`Philox::bounded`], and [`Philox::seek`].
+//!   [`Philox::next_u64`], [`Philox::bounded`], and [`Philox::seek`];
+//!   [`Philox::from_u64_seed_stream`] opens one of 2⁶⁴ independent streams per seed.
 //! - `rand_core` impls ([`rand_core::TryRng`] / [`rand_core::SeedableRng`], hence
 //!   `Rng` / `RngCore`) — the ecosystem drop-in. Behind the default-on
 //!   `rand_core` feature.
@@ -38,6 +40,11 @@
 //! let x = a.next_u32();
 //! b.seek(1_000_000);
 //! assert_eq!(x, b.next_u32());
+//!
+//! // One independent stream per parallel task, keyed by (seed, stream).
+//! let mut task = Philox::from_u64_seed_stream(42, 7);
+//! let u = rand_philox::u32_to_unit_f64(task.next_u32()); // f64 in (0, 1)
+//! assert!(u > 0.0 && u < 1.0);
 //! ```
 #![no_std]
 
@@ -50,10 +57,9 @@ pub use philox::philox4x32_10;
 /// bits so low-entropy standalone seeds (0, 1, 2, …) still produce independent
 /// streams.
 ///
-/// Validated against Stafford's published Mix13 constants; byte-identical to the
-/// finalizer in MCPower and CommonStats (this is the shared copy they extract).
-/// Callers needing a multi-input seed combine their inputs first (xor+rotate,
-/// Weyl add, …) and pass the result through this finalizer.
+/// Validated against Stafford's published Mix13 constants. Callers needing a
+/// multi-input seed combine their inputs first (xor+rotate, Weyl add, …) and
+/// pass the result through this finalizer.
 ///
 /// `z`: the raw seed word. Returns the avalanched word.
 #[inline]
@@ -68,8 +74,7 @@ pub fn splitmix64(mut z: u64) -> u64 {
 ///
 /// Convention: 23-bit mantissa (`word >> 9`) centred by +0.5 so the result is
 /// never exactly 0 or 1 — an inverse-CDF fed by this never sees a saturating
-/// argument. Floor ≈ 2⁻²⁴, cap ≈ 1 − 2⁻²⁴. Byte-identical to MCPower's
-/// `u32_to_unit_f32`.
+/// argument. Floor ≈ 2⁻²⁴, cap ≈ 1 − 2⁻²⁴.
 ///
 /// 23 bits rather than 24: in `f32`, values ≥ 2²³ = 8_388_608 have ULP ≥ 1.0, so
 /// `(max_24bit as f32) + 0.5` would round to 2²⁴ and the result would hit 1.0
@@ -81,6 +86,21 @@ pub fn splitmix64(mut z: u64) -> u64 {
 #[must_use]
 pub fn u32_to_unit_f32(word: u32) -> f32 {
     ((word >> 9) as f32 + 0.5) * (1.0 / 8_388_608.0) // (x+0.5) · 2⁻²³
+}
+
+/// Map a Philox 32-bit word to an `f64` uniform on the **open** interval (0, 1).
+///
+/// Convention: all 32 bits, centred by +0.5 — `(word + 0.5) / 2³²`. The result
+/// is never exactly 0 or 1, so an inverse-CDF fed by it never sees a saturating
+/// argument. Floor = 2⁻³³, cap = 1 − 2⁻³³. Every step is exact in `f64` (a 33-bit
+/// numerator divided by a power of two), so the value is bit-identical on every
+/// host. Resolution is the 2⁻³² grid of one word.
+///
+/// `word`: any Philox output word. Returns a value strictly inside (0, 1).
+#[inline]
+#[must_use]
+pub fn u32_to_unit_f64(word: u32) -> f64 {
+    (f64::from(word) + 0.5) * (1.0 / 4_294_967_296.0) // (w+0.5) · 2⁻³²
 }
 
 /// Counter-addressable Philox4x32-10 RNG.
@@ -144,8 +164,29 @@ impl Philox {
     #[inline]
     #[must_use]
     pub fn from_u64_seed(seed: u64) -> Self {
+        Self::from_u64_seed_stream(seed, 0)
+    }
+
+    /// Open stream `stream` of a `u64` seed: the key is [`splitmix64`]`(seed)` as
+    /// in [`from_u64_seed`](Self::from_u64_seed), and `stream` fills the top 64
+    /// bits of the counter, so the stream starts at block `stream · 2⁶⁴`.
+    ///
+    /// Each seed thus carries 2⁶⁴ non-overlapping streams of 2⁶⁴ blocks each —
+    /// one per parallel task, draw, or purpose — and a stream's words depend only
+    /// on `(seed, stream)`, never on which other streams were read. Counter words
+    /// 0–1 hold the block index within the stream, words 2–3 hold `stream`.
+    /// `from_u64_seed_stream(seed, 0)` equals `from_u64_seed(seed)`.
+    /// [`seek`](Self::seek) takes the full 128-bit counter, not a block index
+    /// within the stream: block `b` of stream `s` is
+    /// `seek((u128::from(s) << 64) | u128::from(b))`.
+    ///
+    /// `seed`: any `u64`. `stream`: the stream index. Returns a stream positioned
+    /// at its first block.
+    #[inline]
+    #[must_use]
+    pub fn from_u64_seed_stream(seed: u64, stream: u64) -> Self {
         let k = splitmix64(seed);
-        Self::new([k as u32, (k >> 32) as u32], 0)
+        Self::new([k as u32, (k >> 32) as u32], u128::from(stream) << 64)
     }
 
     /// Reposition the stream to the start of block `counter`, discarding any
@@ -195,8 +236,7 @@ impl Philox {
     /// Lemire (2019), "Fast Random Integer Generation in an Interval": form the
     /// 64-bit product `m = word · n`; its high 32 bits are the candidate. Reject
     /// only when the low 32 bits fall below the threshold `t = 2³² mod n`, exactly
-    /// the set that would otherwise bias the result. Byte-identical to
-    /// CommonStats' `bounded`.
+    /// the set that would otherwise bias the result.
     ///
     /// `n`: the exclusive upper bound; must be ≥ 1. `n == 1` always returns 0.
     /// Returns a value in `[0, n)`.
@@ -257,8 +297,10 @@ mod rand_core_impl {
     /// Seed layout (frozen): 24 bytes = `key[0] ‖ key[1] ‖ counter`, all
     /// little-endian (8-byte key + 16-byte counter). A transparent bijection onto
     /// [`Philox::new`] — no hidden mixing, so a seed round-trips to exactly its
-    /// stream. For low-entropy `u64` seeds use [`Philox::from_u64_seed`] (or
-    /// `SeedableRng::seed_from_u64`), which avalanches.
+    /// stream. For low-entropy `u64` seeds use [`Philox::from_u64_seed`], which
+    /// avalanches via SplitMix64. `seed_from_u64` is `rand_core`'s default: PCG32
+    /// fills all 24 bytes (key and counter), so it gives a different stream than
+    /// `from_u64_seed`.
     impl SeedableRng for Philox {
         type Seed = [u8; 24];
 
@@ -299,6 +341,51 @@ mod tests {
             let u = u32_to_unit_f32(w);
             assert!(u > 0.0 && u < 1.0, "u={u} out of (0,1)");
         }
+    }
+
+    #[test]
+    fn unit_f64_exact_endpoints_and_open_interval() {
+        // (w + 0.5) / 2³² is exact: the extremes land on 2⁻³³ and 1 − 2⁻³³.
+        assert_eq!(u32_to_unit_f64(0), 1.0 / 8_589_934_592.0);
+        assert_eq!(u32_to_unit_f64(u32::MAX), 1.0 - 1.0 / 8_589_934_592.0);
+        assert_eq!(u32_to_unit_f64(1 << 31), 0.5 + 1.0 / 8_589_934_592.0);
+        for k in 0..10_000u32 {
+            let w = k.wrapping_mul(0x9E37_79B9);
+            let u = u32_to_unit_f64(w);
+            assert!(u > 0.0 && u < 1.0, "u={u} out of (0,1)");
+        }
+    }
+
+    #[test]
+    fn seed_stream_zero_equals_from_u64_seed() {
+        let mut a = Philox::from_u64_seed_stream(42, 0);
+        let mut b = Philox::from_u64_seed(42);
+        for _ in 0..100 {
+            assert_eq!(a.next_u32(), b.next_u32());
+        }
+    }
+
+    // Pins the layout: block index in counter words 0–1, stream in words 2–3.
+    #[test]
+    fn seed_stream_counter_layout() {
+        let stream = 0x0123_4567_89ab_cdef_u64;
+        let k = splitmix64(7);
+        let key = [k as u32, (k >> 32) as u32];
+        let (lo, hi) = (stream as u32, (stream >> 32) as u32);
+        let mut r = Philox::from_u64_seed_stream(7, stream);
+        for block in 0..3u32 {
+            for want in philox4x32_10([block, 0, lo, hi], key) {
+                assert_eq!(r.next_u32(), want);
+            }
+        }
+    }
+
+    #[test]
+    fn different_streams_diverge() {
+        let mut a = Philox::from_u64_seed_stream(42, 0);
+        let mut b = Philox::from_u64_seed_stream(42, 1);
+        let diff = (0..100).filter(|_| a.next_u32() != b.next_u32()).count();
+        assert!(diff > 90, "different streams must diverge");
     }
 
     #[test]
@@ -356,7 +443,7 @@ mod tests {
                 diff += 1;
             }
         }
-        assert!(diff > 90, "different keys must give independent streams");
+        assert!(diff > 90, "different keys must diverge");
         // Different starting counters.
         let mut c = Philox::new([7, 7], 0);
         let mut d = Philox::new([7, 7], 1_000);
@@ -366,10 +453,7 @@ mod tests {
                 diff2 += 1;
             }
         }
-        assert!(
-            diff2 > 90,
-            "different counters must give independent streams"
-        );
+        assert!(diff2 > 90, "different counters must diverge");
     }
 
     #[test]

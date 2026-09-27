@@ -12,7 +12,7 @@ The pitch is the contract, not the algorithm. "It's Philox" is already on the sh
 ## When to use
 
 - **Reproducible parallel draws** — every word is a pure function of `(key, 128-bit counter)` with no carried state, so a draw reproduces exactly regardless of how many draws ran before it, on how many threads, or on which host. Address any draw directly with `seek`.
-- **`no_std` / WASM** — the block function, helpers, and `Philox` are `no_std`, zero-dependency, allocation-free, and have no float in the core (the one float helper, `u32_to_unit_f32`, is a leaf you opt into). The WASM-clean surface is CI-pinned on a wasm target.
+- **`no_std` / WASM** — the block function, helpers, and `Philox` are `no_std`, zero-dependency, allocation-free, and have no float in the core (the float helpers, `u32_to_unit_f32` and `u32_to_unit_f64`, are leaves you opt into). The WASM-clean surface is CI-pinned on a wasm target.
 - **A deterministic `rand` drop-in** — implements `rand_core`'s `TryRng` + `SeedableRng` (hence `Rng` / `RngCore`), so it slots in wherever `rand_chacha` does when you want reproducibility instead of cryptographic strength.
 
 If you need a CSPRNG, use [`rand_chacha`]. If you need raw sequential throughput over cross-host reproducibility, a streaming PRNG (`rand_pcg`, `rand_xoshiro`) will be faster.
@@ -21,7 +21,7 @@ If you need a CSPRNG, use [`rand_chacha`]. If you need raw sequential throughput
 
 ```toml
 [dependencies]
-rand_philox = "0.1"
+rand_philox = "0.2"
 ```
 
 Minimum supported Rust version: **1.85** (the `rand_core` 0.10 floor; the no-feature core compiles below that). The `rand_core` feature is on by default; disable default features for the pure `no_std`, zero-dependency core.
@@ -41,15 +41,22 @@ a.seek(1_000_000);
 let x = a.next_u32();
 b.seek(1_000_000);
 assert_eq!(x, b.next_u32());
+
+// One independent stream per parallel task, keyed by (seed, stream).
+let mut task = Philox::from_u64_seed_stream(42, 7);
+let u = rand_philox::u32_to_unit_f64(task.next_u32()); // f64 in (0, 1)
+assert!(u > 0.0 && u < 1.0);
 ```
 
 ## Convention
 
 - **Counter** — the `counter` passed to `Philox::new` / `seek` is a **block index**: Philox's native 128-bit counter, one increment per `philox4x32_10` call = four output words. `seek(c)` positions the stream at the start of block `c`.
 - **`next_u64`** — two consecutive stream words, low word first (`lo | (hi << 32)`).
+- **`from_u64_seed_stream(seed, stream)`** — key = SplitMix64(`seed`), `stream` in the top 64 bits of the counter: 2⁶⁴ independent streams per seed, each 2⁶⁴ blocks long. Stream 0 equals `from_u64_seed(seed)`. `seek` takes the full counter, so block `b` of stream `s` is `seek((u128::from(s) << 64) | u128::from(b))`.
 - **`u32_to_unit_f32`** — maps a word to an `f32` on the **open** interval (0, 1); 23-bit mantissa centred by +0.5 so it never returns 0 or 1.
+- **`u32_to_unit_f64`** — maps a word to an `f64` on the **open** interval (0, 1): `(word + 0.5) / 2³²`, exact in `f64`, range [2⁻³³, 1 − 2⁻³³].
 - **`bounded(n)`** — unbiased integer in `[0, n)` via Lemire (no modulo bias); `n ≥ 1`, `n == 1` always 0.
-- **Seed (`SeedableRng`)** — 24 bytes = `key[0] ‖ key[1] ‖ counter`, all little-endian; a transparent bijection onto `Philox::new`. For low-entropy `u64` seeds use `from_u64_seed` / `seed_from_u64`, which avalanche via SplitMix64.
+- **Seed (`SeedableRng`)** — 24 bytes = `key[0] ‖ key[1] ‖ counter`, all little-endian; a transparent bijection onto `Philox::new`. For low-entropy `u64` seeds use `from_u64_seed`, which avalanches via SplitMix64. `seed_from_u64` is `rand_core`'s default: PCG32 fills all 24 bytes (key and counter), so it gives a different stream than `from_u64_seed`.
 
 The `philox4x32_10` output is validated against the three published Random123 known-answer vectors, frozen by the crate's KAT test.
 
@@ -60,7 +67,7 @@ The `philox4x32_10` output is validated against the three published Random123 kn
 | Counter-based | draw value = pure function of `(key, counter)`; no carried state |
 | Reproducible | bit-identical across hosts and thread counts; KAT-pinned output |
 | `no_std` | core is `#![no_std]`, zero-dependency, allocation-free |
-| No float in core | the only float touch, `u32_to_unit_f32`, is an opt-in leaf helper |
+| No float in core | the only float touches, `u32_to_unit_f32` / `u32_to_unit_f64`, are opt-in leaf helpers |
 | No `unsafe` | `#![forbid(unsafe_code)]` |
 | WASM-clean | build + test pinned on a wasm target in CI |
 

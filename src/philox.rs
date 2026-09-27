@@ -7,8 +7,7 @@
 //! **Random123** = the counter-based RNG library of Salmon, Moraes, Dror & Shaw
 //! (2011), "Parallel Random Numbers: As Easy as 1, 2, 3", Proc. SC'11 — the
 //! Philox constants, round count, and known-answer vectors below are taken from
-//! it. This block function is byte-identical to MCPower's `engine-core` core and
-//! CommonStats' port (the extraction the crate exists to centralize).
+//! it.
 
 /// Round multiplier constants (Random123 PHILOX_M4x32_{0,1}).
 const PHILOX_M0: u32 = 0xD251_1F53;
