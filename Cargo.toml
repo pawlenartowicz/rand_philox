@@ -1,6 +1,6 @@
 [package]
 name = "rand_philox"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Paweł Lenartowicz"]
 edition = "2021"
 rust-version = "1.85"

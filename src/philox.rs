@@ -53,6 +53,63 @@ pub fn philox4x32_10(ctr: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     c
 }
 
+/// Whether the lane loop compiles to SIMD code: NEON, SSE2/AVX2, and `wasm32`
+/// with `simd128`.
+const SIMD: bool = cfg!(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+));
+
+/// Blocks evaluated together by [`philox4x32_10_lanes`], per target. Measured
+/// in CPU cycles per word on a 100k-word run (wasm under both wasmtime and V8):
+/// 16 lanes vectorize on NEON and SSE2/AVX2; on `wasm32` with `simd128`, 8
+/// lanes (6.8 / 7.0 cycles; 16 lanes: 10.8 / 12.2). Without SIMD (default
+/// `wasm32` and any other target), 2 lanes of plain scalar code (8.7 / 7.0
+/// on `wasm32`; wider arrays spill to memory).
+pub(crate) const LANES: usize = if !SIMD {
+    2
+} else if cfg!(target_arch = "wasm32") {
+    8
+} else {
+    16
+};
+
+/// Low product half as a native 32-bit multiply (the multiply-high shape LLVM
+/// vectorizes) or taken from the widening product (faster as scalar code).
+const LOW_MUL32: bool = SIMD;
+
+/// [`philox4x32_10`] on `LANES` independent blocks at once, struct-of-arrays:
+/// `c[w][l]` is counter word `w` of lane `l` on entry and output word `w` on
+/// exit. Lane `l` computes exactly `philox4x32_10` of its own counter, so the
+/// result is bit-identical to `LANES` scalar calls.
+#[inline(always)]
+pub(crate) fn philox4x32_10_lanes(c: &mut [[u32; LANES]; 4], mut key: [u32; 2]) {
+    let [mut x0, mut x1, mut x2, mut x3] = *c;
+    for r in 0..10 {
+        if r > 0 {
+            key[0] = key[0].wrapping_add(PHILOX_W0);
+            key[1] = key[1].wrapping_add(PHILOX_W1);
+        }
+        let mut n = [[0u32; LANES]; 4];
+        for l in 0..LANES {
+            let p0 = u64::from(x0[l]) * u64::from(PHILOX_M0);
+            let p1 = u64::from(x2[l]) * u64::from(PHILOX_M1);
+            n[0][l] = (p1 >> 32) as u32 ^ x1[l] ^ key[0];
+            n[2][l] = (p0 >> 32) as u32 ^ x3[l] ^ key[1];
+            if LOW_MUL32 {
+                n[1][l] = x2[l].wrapping_mul(PHILOX_M1);
+                n[3][l] = x0[l].wrapping_mul(PHILOX_M0);
+            } else {
+                n[1][l] = p1 as u32;
+                n[3][l] = p0 as u32;
+            }
+        }
+        [x0, x1, x2, x3] = n;
+    }
+    *c = [x0, x1, x2, x3];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

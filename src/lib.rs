@@ -1,65 +1,68 @@
-//! Counter-based Philox4x32-10 RNG with a reproducibility contract.
+//! Philox4x32-10, the counter-based generator of Salmon et al. (2011).
 //!
-//! The headline is not the algorithm (Philox is well known) but the contract:
-//! **bit-identical output across hosts and thread counts, KAT-pinned, `no_std`,
-//! no float in the core, drop-in for `rand_chacha`.** Every word is a pure
-//! function of `(key, counter)` with no carried entropy, so re-running any draw
-//! reproduces it exactly — independent of how many draws ran before it or on
-//! which thread. That is the slot the `rand` ecosystem leaves empty.
+//! Every output word is a function of a 64-bit key and a 128-bit counter, with
+//! no other state, so any draw can be recomputed on its own: the result does not
+//! depend on how many draws ran before it, on which thread, or on which platform.
 //!
-//! # Layers
+//! # Contents
 //!
-//! - [`philox4x32_10`] — the block function, the KAT-frozen primitive.
-//! - [`splitmix64`] / [`u32_to_unit_f32`] / [`u32_to_unit_f64`] — generic leaf
-//!   helpers (seed avalanche; word → open-interval `f32` / `f64`). The only float
-//!   touches in the crate.
-//! - [`Philox`] — counter-addressable RNG: `(key, 128-bit counter)` → reproducible
-//!   words at any counter position, with buffered [`Philox::next_u32`] /
-//!   [`Philox::next_u64`], [`Philox::bounded`], and [`Philox::seek`];
-//!   [`Philox::from_u64_seed_stream`] opens one of 2⁶⁴ independent streams per seed.
-//! - `rand_core` impls ([`rand_core::TryRng`] / [`rand_core::SeedableRng`], hence
-//!   `Rng` / `RngCore`) — the ecosystem drop-in. Behind the default-on
-//!   `rand_core` feature.
+//! - [`philox4x32_10`]: the block function, checked against the Random123
+//!   known-answer vectors.
+//! - [`splitmix64`]: seed mixing. [`u32_to_unit_f32`] and [`u32_to_unit_f64`]:
+//!   a word to a float on the open interval (0, 1). These two are the only
+//!   floating-point code in the crate.
+//! - [`Philox`]: a generator over `(key, counter)` with [`Philox::next_u32`],
+//!   [`Philox::next_u64`], [`Philox::fill_u32`], [`Philox::bounded`],
+//!   [`Philox::seek`] and [`Philox::key`]; [`Philox::from_u64_seed_stream`] opens one of 2⁶⁴ streams
+//!   per seed.
+//! - With the default `rand_core` feature: [`rand_core::TryRng`] and
+//!   [`rand_core::SeedableRng`], hence `Rng` / `RngCore`.
 //!
-//! The block function, the helpers, and [`Philox`] are `no_std`, zero-dependency,
-//! and allocation-free — the WASM-clean surface. The `rand_core` feature adds the
-//! one small `no_std` dependency.
+//! Without features the crate is `no_std`, allocation-free and has no
+//! dependencies.
 //!
 //! # Example
 //!
 //! ```
 //! use rand_philox::Philox;
 //!
-//! // Same (key, counter) reproduces the same stream, anywhere.
+//! // Same (key, counter) gives the same stream.
 //! let mut a = Philox::from_u64_seed(42);
 //! let mut b = Philox::from_u64_seed(42);
 //! assert_eq!(a.next_u32(), b.next_u32());
 //!
-//! // Jump to any counter position and read deterministically.
+//! // Jump to a counter position and read from there.
 //! a.seek(1_000_000);
 //! let x = a.next_u32();
 //! b.seek(1_000_000);
 //! assert_eq!(x, b.next_u32());
 //!
-//! // One independent stream per parallel task, keyed by (seed, stream).
+//! // One stream per parallel task, keyed by (seed, stream).
 //! let mut task = Philox::from_u64_seed_stream(42, 7);
 //! let u = rand_philox::u32_to_unit_f64(task.next_u32()); // f64 in (0, 1)
 //! assert!(u > 0.0 && u < 1.0);
+//!
+//! // Many words at once (same words as a next_u32 loop, faster).
+//! let mut words = [0u32; 1024];
+//! task.fill_u32(&mut words);
 //! ```
 #![no_std]
 
 mod philox;
 
 pub use philox::philox4x32_10;
+use philox::{philox4x32_10_lanes, LANES};
 
-/// David Stafford's "Mix13" SplitMix64 finalizer — the avalanche function also
-/// used by Java's `SplittableRandom`. Mixes a raw `u64` seed into well-separated
-/// bits so low-entropy standalone seeds (0, 1, 2, …) still produce independent
-/// streams.
+/// The SplitMix64 output function (David Stafford's "Mix13" finalizer, also used
+/// by Java's `SplittableRandom`). Mixes a raw `u64` seed into well-separated
+/// bits so low-entropy seeds (1, 2, 3, …) still give independent streams.
 ///
-/// Validated against Stafford's published Mix13 constants. Callers needing a
-/// multi-input seed combine their inputs first (xor+rotate, Weyl add, …) and
-/// pass the result through this finalizer.
+/// This is the finalizer alone: unlike a SplitMix64 generator it does not add
+/// the golden-ratio increment `0x9e37_79b9_7f4a_7c15` first, so
+/// `splitmix64(0) == 0`, and `splitmix64(0x9e37_79b9_7f4a_7c15)` is the first
+/// output of reference SplitMix64 seeded with 0. Callers needing a multi-input
+/// seed combine their inputs first (xor+rotate, Weyl add, …) and pass the
+/// result through this function.
 ///
 /// `z`: the raw seed word. Returns the avalanched word.
 #[inline]
@@ -136,6 +139,28 @@ fn counter_words(c: u128) -> [u32; 4] {
     ]
 }
 
+/// Blocks `w0, w0 + 1, …` (counter words 1–3 fixed to `hi`) written to `out`,
+/// `LANES` blocks per step through [`philox4x32_10_lanes`]. `out.len()` is a
+/// multiple of the step and the run must not carry out of word 0. Kept out of
+/// line: inlined into `fill_u32` it compiles slower on `wasm32` with `simd128`.
+#[inline(never)]
+fn fill_run(key: [u32; 2], w0: u32, hi: [u32; 3], out: &mut [u32]) {
+    let mut ctr = w0;
+    for chunk in out.chunks_exact_mut(4 * LANES) {
+        let mut c = [[0; LANES], [hi[0]; LANES], [hi[1]; LANES], [hi[2]; LANES]];
+        for (l, w) in (0u32..).zip(&mut c[0]) {
+            *w = ctr.wrapping_add(l);
+        }
+        philox4x32_10_lanes(&mut c, key);
+        for (l, block) in chunk.chunks_exact_mut(4).enumerate() {
+            for (out, word) in block.iter_mut().zip(&c) {
+                *out = word[l];
+            }
+        }
+        ctr = ctr.wrapping_add(LANES as u32);
+    }
+}
+
 impl Philox {
     /// Open a stream at block `counter` with an explicit 64-bit `key` (two `u32`
     /// words). For a single `u64` seed without a prepared key, use
@@ -189,6 +214,14 @@ impl Philox {
         Self::new([k as u32, (k >> 32) as u32], u128::from(stream) << 64)
     }
 
+    /// The two key words this stream was built with (as passed to
+    /// [`new`](Self::new), or derived by [`from_u64_seed`](Self::from_u64_seed)).
+    #[inline]
+    #[must_use]
+    pub fn key(&self) -> [u32; 2] {
+        self.key
+    }
+
     /// Reposition the stream to the start of block `counter`, discarding any
     /// buffered words.
     ///
@@ -207,7 +240,8 @@ impl Philox {
     /// block boundary exactly.
     #[inline]
     pub fn next_u32(&mut self) -> u32 {
-        if self.buf_pos == 4 {
+        // `>=` (not `==`) lets the optimizer drop the bounds check on `buf`.
+        if self.buf_pos >= 4 {
             self.buf = philox4x32_10(counter_words(self.counter), self.key);
             self.counter = self.counter.wrapping_add(1);
             self.buf_pos = 0;
@@ -215,6 +249,45 @@ impl Philox {
         let w = self.buf[self.buf_pos];
         self.buf_pos += 1;
         w
+    }
+
+    /// Fill `dest` with the next `dest.len()` stream words: exactly the words,
+    /// and the end state, of `dest.len()` calls to [`next_u32`](Self::next_u32).
+    ///
+    /// Whole blocks are generated directly into `dest`, several at a time on
+    /// SIMD targets; prefer this over a `next_u32` loop when you need many
+    /// words at once.
+    pub fn fill_u32(&mut self, dest: &mut [u32]) {
+        // Finish the current block so the loops below start block-aligned.
+        let (head, dest) = dest.split_at_mut((4 - self.buf_pos).min(dest.len()));
+        for w in head {
+            *w = self.next_u32();
+        }
+        // Runs of whole steps counted in a `u32` copy of counter word 0 (the
+        // `u128` is touched once per run: costly where the widest integer is
+        // 64 bits, e.g. wasm32). A run stops before word 0 would carry.
+        let bps = LANES; // blocks per step
+        let mut rest = dest;
+        while rest.len() >= 4 * bps {
+            let [w0, w1, w2, w3] = counter_words(self.counter);
+            let room = ((u32::MAX - w0) / bps as u32) as usize;
+            if room == 0 {
+                let (step, tail) = rest.split_at_mut(4 * bps);
+                for w in step {
+                    *w = self.next_u32();
+                }
+                rest = tail;
+                continue;
+            }
+            let steps = (rest.len() / (4 * bps)).min(room);
+            let (run, tail) = rest.split_at_mut(4 * bps * steps);
+            fill_run(self.key, w0, [w1, w2, w3], run);
+            self.counter = self.counter.wrapping_add((bps * steps) as u128);
+            rest = tail;
+        }
+        for w in rest {
+            *w = self.next_u32();
+        }
     }
 
     /// Next pseudo-random 64-bit word.
@@ -279,7 +352,22 @@ mod rand_core_impl {
 
         #[inline]
         fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-            let mut chunks = dst.chunks_exact_mut(4);
+            // Finish the current block first so every bulk chunk starts
+            // block-aligned and takes `fill_u32`'s multi-block path.
+            let lead = (4 * (4 - self.buf_pos)).min(dst.len() & !3);
+            let (head, dst) = dst.split_at_mut(lead);
+            for b in head.chunks_exact_mut(4) {
+                b.copy_from_slice(&self.next_u32().to_le_bytes());
+            }
+            let mut chunks = dst.chunks_exact_mut(4 * 64);
+            let mut words = [0u32; 64];
+            for chunk in &mut chunks {
+                self.fill_u32(&mut words);
+                for (b, w) in chunk.chunks_exact_mut(4).zip(&words) {
+                    b.copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            let mut chunks = chunks.into_remainder().chunks_exact_mut(4);
             for chunk in &mut chunks {
                 chunk.copy_from_slice(&self.next_u32().to_le_bytes());
             }
@@ -319,141 +407,99 @@ mod rand_core_impl {
 mod tests {
     use super::*;
 
+    // Pinned against Vigna's reference SplitMix64 (state += golden gamma, then
+    // this finalizer): its first outputs for seed 0. Every `from_u64_seed` key
+    // rides on these bits, so a changed shift or constant must fail here.
     #[test]
-    fn splitmix64_distinct_for_adjacent_seeds() {
-        // Adjacent seeds avalanche to well-separated words — the property that
-        // keeps low-entropy sequential seeds (0, 1, 2, …) independent. (Note the
-        // Mix13 finalizer fixes 0 → 0, so don't assert 0 maps off itself.)
-        assert_ne!(splitmix64(0), splitmix64(1));
-        assert_ne!(splitmix64(1), splitmix64(2));
-        assert_ne!(splitmix64(2), splitmix64(3));
+    fn splitmix64_matches_reference_outputs() {
+        const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+        assert_eq!(splitmix64(GAMMA), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(splitmix64(GAMMA.wrapping_mul(2)), 0x6e78_9e6a_a1b9_65f4);
     }
 
+    // (w >> 9 + 0.5) · 2⁻²³ is exact: extremes land on 2⁻²⁴ and 1 − 2⁻²⁴.
     #[test]
-    fn unit_f32_in_open_interval() {
-        // Field extremes map strictly inside (0,1), and ordered.
-        assert!(u32_to_unit_f32(0) > 0.0);
-        assert!(u32_to_unit_f32(u32::MAX) < 1.0);
-        assert!(u32_to_unit_f32(0) < u32_to_unit_f32(u32::MAX));
-        // Dense scan stays in range.
-        for k in 0..10_000u32 {
-            let w = k.wrapping_mul(0x9E37_79B9);
-            let u = u32_to_unit_f32(w);
-            assert!(u > 0.0 && u < 1.0, "u={u} out of (0,1)");
-        }
+    fn unit_f32_exact_endpoints() {
+        let eps = 1.0 / 16_777_216.0; // 2⁻²⁴
+        assert_eq!(u32_to_unit_f32(0), eps);
+        assert_eq!(u32_to_unit_f32(u32::MAX), 1.0 - eps);
+        assert_eq!(u32_to_unit_f32(1 << 31), 0.5 + eps);
     }
 
+    // (w + 0.5) / 2³² is exact: the extremes land on 2⁻³³ and 1 − 2⁻³³.
     #[test]
-    fn unit_f64_exact_endpoints_and_open_interval() {
-        // (w + 0.5) / 2³² is exact: the extremes land on 2⁻³³ and 1 − 2⁻³³.
-        assert_eq!(u32_to_unit_f64(0), 1.0 / 8_589_934_592.0);
-        assert_eq!(u32_to_unit_f64(u32::MAX), 1.0 - 1.0 / 8_589_934_592.0);
-        assert_eq!(u32_to_unit_f64(1 << 31), 0.5 + 1.0 / 8_589_934_592.0);
-        for k in 0..10_000u32 {
-            let w = k.wrapping_mul(0x9E37_79B9);
-            let u = u32_to_unit_f64(w);
-            assert!(u > 0.0 && u < 1.0, "u={u} out of (0,1)");
-        }
+    fn unit_f64_exact_endpoints() {
+        let eps = 1.0 / 8_589_934_592.0; // 2⁻³³
+        assert_eq!(u32_to_unit_f64(0), eps);
+        assert_eq!(u32_to_unit_f64(u32::MAX), 1.0 - eps);
+        assert_eq!(u32_to_unit_f64(1 << 31), 0.5 + eps);
     }
 
-    #[test]
-    fn seed_stream_zero_equals_from_u64_seed() {
-        let mut a = Philox::from_u64_seed_stream(42, 0);
-        let mut b = Philox::from_u64_seed(42);
-        for _ in 0..100 {
-            assert_eq!(a.next_u32(), b.next_u32());
-        }
-    }
-
-    // Pins the layout: block index in counter words 0–1, stream in words 2–3.
+    // Pins the layout: block index in counter words 0–1, stream in words 2–3,
+    // key = the two halves of splitmix64(seed); stream 0 is `from_u64_seed`.
     #[test]
     fn seed_stream_counter_layout() {
-        let stream = 0x0123_4567_89ab_cdef_u64;
         let k = splitmix64(7);
         let key = [k as u32, (k >> 32) as u32];
-        let (lo, hi) = (stream as u32, (stream >> 32) as u32);
-        let mut r = Philox::from_u64_seed_stream(7, stream);
-        for block in 0..3u32 {
-            for want in philox4x32_10([block, 0, lo, hi], key) {
-                assert_eq!(r.next_u32(), want);
+        for stream in [0, 0x0123_4567_89ab_cdef_u64] {
+            let (lo, hi) = (stream as u32, (stream >> 32) as u32);
+            let mut r = if stream == 0 {
+                Philox::from_u64_seed(7)
+            } else {
+                Philox::from_u64_seed_stream(7, stream)
+            };
+            assert_eq!(r.key(), key);
+            for block in 0..3u32 {
+                for want in philox4x32_10([block, 0, lo, hi], key) {
+                    assert_eq!(r.next_u32(), want);
+                }
             }
         }
     }
 
+    // `seek` lands on the start of the block and discards a half-read buffer.
+    // The counter has four distinct nonzero words, so each word's position in
+    // the little-endian split is pinned.
     #[test]
-    fn different_streams_diverge() {
-        let mut a = Philox::from_u64_seed_stream(42, 0);
-        let mut b = Philox::from_u64_seed_stream(42, 1);
-        let diff = (0..100).filter(|_| a.next_u32() != b.next_u32()).count();
-        assert!(diff > 90, "different streams must diverge");
-    }
-
-    #[test]
-    fn same_key_counter_reproduces_stream() {
-        let mut a = Philox::new([0xdead_beef, 0x1234_5678], 0);
-        let mut b = Philox::new([0xdead_beef, 0x1234_5678], 0);
-        for _ in 0..1000 {
-            assert_eq!(a.next_u32(), b.next_u32());
-        }
-    }
-
-    #[test]
-    fn reproduces_across_block_boundaries() {
-        // 37 words crosses several 4-word block refills; the keyed refill must
-        // not depend on carried state.
-        let mut a = Philox::from_u64_seed(1);
-        let mut first = [0u32; 37];
-        for w in &mut first {
-            *w = a.next_u32();
-        }
-        let mut b = Philox::from_u64_seed(1);
-        for &w in &first {
-            assert_eq!(b.next_u32(), w);
-        }
-    }
-
-    #[test]
-    fn seek_addresses_blocks_deterministically() {
+    fn seek_addresses_blocks_and_discards_buffer() {
         let key = [42, 7];
-        // Read the 5th block (words 16..20) sequentially...
-        let mut seq = Philox::new(key, 0);
-        let mut want = [0u32; 4];
-        for _ in 0..16 {
-            seq.next_u32();
-        }
-        for w in &mut want {
-            *w = seq.next_u32();
-        }
-        // ...and by seeking straight to block 4.
-        let mut jumped = Philox::new(key, 0);
-        jumped.seek(4);
-        for &w in &want {
-            assert_eq!(jumped.next_u32(), w);
+        let mut r = Philox::new(key, 0);
+        r.next_u32(); // leave three buffered words behind
+        r.seek(0x0000_0003_0000_0002_0000_0001_0000_0004);
+        for want in philox4x32_10([4, 1, 2, 3], key) {
+            assert_eq!(r.next_u32(), want);
         }
     }
 
+    // The bulk path must be invisible: same words and same end state as a
+    // `next_u32` loop, from every in-block offset, across the multi-lane chunk
+    // boundary, and across the 128-bit counter wrap (lane counters carry).
     #[test]
-    fn different_keys_and_counters_diverge() {
-        // Different keys.
-        let mut a = Philox::new([42, 0], 0);
-        let mut b = Philox::new([42, 1], 0);
-        let mut diff = 0usize;
-        for _ in 0..100 {
-            if a.next_u32() != b.next_u32() {
-                diff += 1;
+    fn fill_u32_equals_next_u32_loop() {
+        let mut buf = [0u32; 4 * LANES * 2 + 7];
+        for start in [0u128, 5, u128::MAX - 9, (1u128 << 64) - 3] {
+            for skip in 0..4 {
+                for len in [0, 1, 3, 4, 5, 4 * LANES - 1, 4 * LANES, buf.len()] {
+                    let mut seq = Philox::new([0x1234_5678, 0x9abc_def0], start);
+                    let mut bulk = seq.clone();
+                    for _ in 0..skip {
+                        seq.next_u32();
+                        bulk.next_u32();
+                    }
+                    bulk.fill_u32(&mut buf[..len]);
+                    for (i, &w) in buf[..len].iter().enumerate() {
+                        assert_eq!(
+                            w,
+                            seq.next_u32(),
+                            "start {start} skip {skip} len {len} word {i}"
+                        );
+                    }
+                    for _ in 0..5 {
+                        assert_eq!(bulk.next_u32(), seq.next_u32(), "end state, len {len}");
+                    }
+                }
             }
         }
-        assert!(diff > 90, "different keys must diverge");
-        // Different starting counters.
-        let mut c = Philox::new([7, 7], 0);
-        let mut d = Philox::new([7, 7], 1_000);
-        let mut diff2 = 0usize;
-        for _ in 0..100 {
-            if c.next_u32() != d.next_u32() {
-                diff2 += 1;
-            }
-        }
-        assert!(diff2 > 90, "different counters must diverge");
     }
 
     #[test]
@@ -465,45 +511,26 @@ mod tests {
         assert_eq!(b.next_u64(), lo | (hi << 32));
     }
 
+    // `bounded` is Lemire's method on the word stream, exactly: same values and
+    // same word consumption as the textbook loop below (threshold 2³² mod n,
+    // reject while the low half is under it). Unbiasedness is Lemire's theorem;
+    // pinning the algorithm also pins the resample indices consumers derive.
+    // 3·10⁹ rejects ~30 % of words, so the rejection loop is exercised.
     #[test]
-    fn bounded_one_is_always_zero() {
-        let mut r = Philox::from_u64_seed(3);
-        for _ in 0..1000 {
-            assert_eq!(r.bounded(1), 0);
-        }
-    }
-
-    #[test]
-    fn bounded_stays_in_range() {
+    fn bounded_is_lemire_on_the_stream() {
         let mut r = Philox::from_u64_seed(11);
-        for &n in &[2u32, 3, 7, 10, 100, 1000] {
-            for _ in 0..5000 {
-                assert!(r.bounded(n) < n, "bounded({n}) out of range");
+        let mut words = r.clone();
+        for n in [1u32, 2, 7, 1000, 1 << 31, 3_000_000_000, u32::MAX] {
+            let t = ((1u64 << 32) % u64::from(n)) as u32;
+            for _ in 0..2000 {
+                let want = loop {
+                    let m = u64::from(words.next_u32()) * u64::from(n);
+                    if (m as u32) >= t {
+                        break (m >> 32) as u32;
+                    }
+                };
+                assert_eq!(r.bounded(n), want, "bounded({n})");
             }
-        }
-    }
-
-    // No modulo bias: over many draws every bucket in [0, n) is hit with roughly
-    // equal frequency. A biased floor(u*n) would over-fill the low buckets; this
-    // χ²-style spread check catches gross deviation.
-    #[test]
-    fn bounded_is_approximately_uniform() {
-        let n = 7u32;
-        let draws = 700_000usize;
-        let mut counts = [0u64; 7];
-        let mut r = Philox::from_u64_seed(2024);
-        for _ in 0..draws {
-            counts[r.bounded(n) as usize] += 1;
-        }
-        let expected = draws as f64 / f64::from(n);
-        for (i, &c) in counts.iter().enumerate() {
-            // Manual abs: `f64::abs` is std-only, unavailable in this no_std crate.
-            let d = c as f64 - expected;
-            let rel = (if d < 0.0 { -d } else { d }) / expected;
-            assert!(
-                rel < 0.02,
-                "bucket {i} count {c} deviates {rel:.4} from uniform"
-            );
         }
     }
 }

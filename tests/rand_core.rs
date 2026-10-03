@@ -5,16 +5,6 @@
 use rand_core::{Rng, SeedableRng};
 use rand_philox::Philox;
 
-#[test]
-fn seedable_reproduces_from_same_seed() {
-    let seed = [9u8; 24];
-    let mut a = Philox::from_seed(seed);
-    let mut b = Philox::from_seed(seed);
-    for _ in 0..64 {
-        assert_eq!(a.next_u32(), b.next_u32());
-    }
-}
-
 // The frozen seed layout: 24 bytes = key[0] ‖ key[1] ‖ counter, all LE, a
 // transparent bijection onto `Philox::new`.
 #[test]
@@ -36,41 +26,30 @@ fn from_seed_matches_new() {
     }
 }
 
+// `fill_bytes` is the little-endian word stream: whole words, then a partial
+// tail that consumes one whole word and keeps its leading bytes. The lengths
+// straddle the 256-byte bulk chunk, from a block-aligned and a mid-block start.
 #[test]
-fn fill_bytes_agrees_with_next_u32() {
-    let seed = [7u8; 24];
-    let mut a = Philox::from_seed(seed);
-    let mut buf = [0u8; 16];
-    a.fill_bytes(&mut buf);
-
-    let mut b = Philox::from_seed(seed);
-    let mut expect = [0u8; 16];
-    for chunk in expect.chunks_mut(4) {
-        chunk.copy_from_slice(&b.next_u32().to_le_bytes());
-    }
-    assert_eq!(buf, expect);
-}
-
-// A partial tail consumes one whole word and takes its leading bytes.
-#[test]
-fn fill_bytes_partial_tail() {
-    let seed = [3u8; 24];
-    let mut a = Philox::from_seed(seed);
-    let mut buf = [0u8; 6];
-    a.fill_bytes(&mut buf);
-
-    let mut b = Philox::from_seed(seed);
-    let w0 = b.next_u32().to_le_bytes();
-    let w1 = b.next_u32().to_le_bytes();
-    assert_eq!(&buf[..4], &w0);
-    assert_eq!(&buf[4..6], &w1[..2]);
-}
-
-#[test]
-fn seed_from_u64_reproduces() {
-    let mut a = Philox::seed_from_u64(12_345);
-    let mut b = Philox::seed_from_u64(12_345);
-    for _ in 0..32 {
-        assert_eq!(a.next_u32(), b.next_u32());
+fn fill_bytes_is_the_le_word_stream() {
+    for skip in [0, 1] {
+        for len in [0usize, 1, 6, 16, 255, 256, 257, 1029] {
+            let mut a = Philox::from_seed([7u8; 24]);
+            for _ in 0..skip {
+                a.next_u32();
+            }
+            let mut b = a.clone();
+            let mut buf = vec![0u8; len];
+            a.fill_bytes(&mut buf);
+            let mut expect = Vec::with_capacity(len + 4);
+            while expect.len() < len {
+                expect.extend_from_slice(&b.next_u32().to_le_bytes());
+            }
+            assert_eq!(buf, expect[..len], "skip {skip} len {len}");
+            assert_eq!(
+                a.next_u32(),
+                b.next_u32(),
+                "end state, skip {skip} len {len}"
+            );
+        }
     }
 }
